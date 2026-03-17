@@ -55,7 +55,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))
-DB_PATH = "lms_school.db"
+DB_PATH = "/app/data/lms_school.db"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
