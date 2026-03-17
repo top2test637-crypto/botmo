@@ -130,6 +130,10 @@ def init_db() -> None:
             added_at    TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id     INTEGER PRIMARY KEY
+        );
+
         CREATE TABLE IF NOT EXISTS channels (
             channel_username TEXT PRIMARY KEY,
             channel_title    TEXT,
@@ -1737,7 +1741,10 @@ def build_application() -> Application:
                 filters.Regex("^📣 إرسال رسالة جماعية$") & filters.TEXT,
                 start_broadcast,
             )
+        
+            
         ],
+        per_message=False,
         states={
             ST_BROADCAST_MSG: [
                 MessageHandler(
