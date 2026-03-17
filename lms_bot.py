@@ -142,12 +142,12 @@ def init_db() -> None:
 
         CREATE TABLE IF NOT EXISTS categories (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            parent_id   INTEGER NOT NULL DEFAULT 0,
+            parent_id   INTEGER DEFAULT NULL,
             name        TEXT    NOT NULL,
             sort_order  INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE CASCADE
         );
-
+                      
         CREATE TABLE IF NOT EXISTS contents (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             category_id  INTEGER NOT NULL,
@@ -287,10 +287,15 @@ def db_remove_channel(username: str) -> None:
 
 def db_get_subcategories(parent_id: int) -> list:
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM categories WHERE parent_id=? ORDER BY sort_order, id",
-        (parent_id,),
-    ).fetchall()
+    if parent_id == 0:
+        rows = conn.execute(
+            "SELECT * FROM categories WHERE parent_id IS NULL ORDER BY sort_order, id",
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM categories WHERE parent_id=? ORDER BY sort_order, id",
+            (parent_id,),
+        ).fetchall()
     conn.close()
     return rows
 
@@ -304,9 +309,11 @@ def db_get_category(cat_id: int) -> Optional[sqlite3.Row]:
 
 def db_add_category(parent_id: int, name: str) -> int:
     conn = get_db()
+    # parent_id=0 يعني الجذر، نحوله NULL عشان يتجاوز الـ Foreign Key
+    actual_parent = None if parent_id == 0 else parent_id
     conn.execute(
         "INSERT INTO categories (parent_id, name, sort_order) VALUES (?,?,?)",
-        (parent_id, name, 0),
+        (actual_parent, name, 0),
     )
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
