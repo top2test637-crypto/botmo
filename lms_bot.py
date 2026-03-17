@@ -54,7 +54,11 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))
+OWNER_IDS = set(
+    int(x.strip())
+    for x in os.getenv("OWNER_IDS", "123456789").split(",")
+    if x.strip().isdigit()
+)
 DB_PATH = "/app/data/lms_school.db"
 
 logging.basicConfig(
@@ -89,7 +93,10 @@ logger = logging.getLogger(__name__)
 
     # Channel management
     ST_ADD_CHANNEL,
-) = range(12)
+    # Owner management
+    ST_ADD_OWNER_ID,
+    ST_REMOVE_OWNER_ID,
+) = range(14)
 
 # ─────────────────────────────────────────────────────────────────
 # 🗄️ DATABASE LAYER
@@ -117,8 +124,10 @@ def init_db() -> None:
             joined_at   TEXT    DEFAULT (datetime('now'))
         );
 
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id     INTEGER PRIMARY KEY
+        CREATE TABLE IF NOT EXISTS owners (
+            user_id     INTEGER PRIMARY KEY,
+            added_by    INTEGER,
+            added_at    TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS channels (
@@ -179,7 +188,7 @@ def db_count_users() -> int:
 # ── Admins ─────────────────────────────────────────────────────
 
 def db_is_admin(user_id: int) -> bool:
-    if user_id == OWNER_ID:
+    if db_is_owner(user_id):
         return True
     conn = get_db()
     row = conn.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)).fetchone()
@@ -213,6 +222,35 @@ def db_count_admins() -> int:
     count = conn.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
     conn.close()
     return count
+
+def db_is_owner(user_id: int) -> bool:
+    if user_id in OWNER_IDS:
+        return True
+    conn = get_db()
+    row = conn.execute("SELECT 1 FROM owners WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+def db_add_owner(user_id: int, added_by: int) -> None:
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO owners (user_id, added_by) VALUES (?,?)",
+        (user_id, added_by),
+    )
+    conn.commit()
+    conn.close()
+
+def db_remove_owner(user_id: int) -> None:
+    conn = get_db()
+    conn.execute("DELETE FROM owners WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def db_get_all_owners() -> list:
+    conn = get_db()
+    rows = conn.execute("SELECT user_id, added_by, added_at FROM owners").fetchall()
+    conn.close()
+    return rows
 
 
 # ── Channels ───────────────────────────────────────────────────
@@ -419,13 +457,15 @@ def subscription_required_keyboard(missing: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def build_admin_reply_keyboard() -> ReplyKeyboardMarkup:
+def build_admin_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     keyboard = [
         ["📂 إدارة المحتوى", "📢 إدارة القنوات"],
         ["📣 إرسال رسالة جماعية", "👤 إضافة مشرف"],
         ["📊 إحصائيات", "💾 نسخ احتياطي"],
         ["👁️ وضع الطالب", "🚪 خروج من لوحة التحكم"],
     ]
+    if db_is_owner(user_id):
+        keyboard.insert(2, ["👑 إدارة الأونرز"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -635,7 +675,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"👑 <b>مرحباً مشرف {user.first_name}!</b>\n"
             "لوحة تحكم المشرف جاهزة.",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_admin_reply_keyboard(),
+            reply_markup=build_admin_reply_keyboard(update.effective_user.id),
         )
     else:
         await update.message.reply_text(
@@ -1151,8 +1191,13 @@ async def admin_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     text = update.message.text
-
+    
     match text:
+
+        case "👑 إدارة الأونرز":
+            if db_is_owner(user_id):
+                await show_owners_panel(update, context)
+
         case "📂 إدارة المحتوى":
             context.user_data["path_stack"] = []
             context.user_data["current_cat"] = 0
@@ -1192,7 +1237,7 @@ async def admin_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data["student_test_mode"] = False
             await update.message.reply_text(
                 "✅ عدت إلى لوحة التحكم.",
-                reply_markup=build_admin_reply_keyboard(),
+                reply_markup=build_admin_reply_keyboard(update.effective_user.id),
             )
 
         case "🚪 خروج من لوحة التحكم":
@@ -1200,6 +1245,138 @@ async def admin_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "تم الخروج. اضغط /start للبدء من جديد.",
                 reply_markup=ReplyKeyboardRemove(),
             )
+
+async def show_owners_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not db_is_owner(user_id):
+        await update.message.reply_text("⛔ هذا الأمر للأونرز فقط.")
+        return
+
+    owners_db = db_get_all_owners()
+
+    text = "👑 <b>إدارة الأونرز</b>\n\n"
+    text += "<b>أونرز ثابتون (من الإعدادات):</b>\n"
+    for oid in OWNER_IDS:
+        text += f"• <code>{oid}</code> ⭐\n"
+
+    if owners_db:
+        text += "\n<b>أونرز مضافون من البوت:</b>\n"
+        for row in owners_db:
+            text += (
+                f"• <code>{row['user_id']}</code> "
+                f"— أضافه: <code>{row['added_by']}</code> "
+                f"— {row['added_at']}\n"
+            )
+    else:
+        text += "\n<i>لا يوجد أونرز مضافون من البوت بعد.</i>\n"
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ إضافة أونر", callback_data="owner_add")],
+            [InlineKeyboardButton("🗑️ حذف أونر", callback_data="owner_remove")],
+        ]),
+    )
+
+
+async def owner_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    if not db_is_owner(user_id):
+        await query.answer("⛔ غير مصرح.", show_alert=True)
+        return ConversationHandler.END
+
+    if query.data == "owner_add":
+        await query.edit_message_text(
+            "👑 <b>إضافة أونر جديد</b>\n\n"
+            "أرسل الـ <b>User ID</b> الرقمي:\n\n"
+            "أو /cancel للإلغاء.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ST_ADD_OWNER_ID
+
+    if query.data == "owner_remove":
+        owners_db = db_get_all_owners()
+        if not owners_db:
+            await query.answer("لا يوجد أونرز لحذفهم.", show_alert=True)
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "🗑️ <b>حذف أونر</b>\n\n"
+            "أرسل الـ <b>User ID</b> للأونر المراد حذفه:\n\n"
+            "أو /cancel للإلغاء.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ST_REMOVE_OWNER_ID
+
+    return ConversationHandler.END
+
+
+async def receive_new_owner_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if not text.isdigit():
+        await update.message.reply_text("❌ أرسل رقم ID صحيح فقط.")
+        return ST_ADD_OWNER_ID
+
+    new_owner = int(text)
+
+    if db_is_owner(new_owner):
+        await update.message.reply_text("ℹ️ هذا المستخدم أونر بالفعل.")
+    else:
+        db_add_owner(new_owner, added_by=user_id)
+        await update.message.reply_text(
+            f"✅ تم إضافة <code>{new_owner}</code> كأونر بنجاح.",
+            parse_mode=ParseMode.HTML,
+        )
+        # إشعار الأونر الجديد
+        try:
+            await context.bot.send_message(
+                chat_id=new_owner,
+                text="🎉 تم منحك صلاحية <b>أونر</b> في البوت!\nاضغط /start للبدء.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        "العودة:", reply_markup=build_admin_reply_keyboard(user_id)
+    )
+    return ConversationHandler.END
+
+
+async def receive_remove_owner_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if not text.isdigit():
+        await update.message.reply_text("❌ أرسل رقم ID صحيح فقط.")
+        return ST_REMOVE_OWNER_ID
+
+    target = int(text)
+
+    if target in OWNER_IDS:
+        await update.message.reply_text(
+            "⛔ لا يمكن حذف الأونرز الثابتين من الإعدادات."
+        )
+    elif not db_is_owner(target):
+        await update.message.reply_text("ℹ️ هذا المستخدم ليس أونر أصلاً.")
+    else:
+        db_remove_owner(target)
+        await update.message.reply_text(
+            f"✅ تم حذف <code>{target}</code> من الأونرز.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        "العودة:", reply_markup=build_admin_reply_keyboard(user_id)
+    )
+    return ConversationHandler.END
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1315,7 +1492,7 @@ async def receive_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ST_ADD_ADMIN_ID
 
     new_admin_id = int(text)
-    if new_admin_id == OWNER_ID:
+    if new_admin_id in OWNER_IDS:
         await update.message.reply_text("ℹ️ هذا المستخدم هو المالك أصلاً.")
     elif db_is_admin(new_admin_id):
         await update.message.reply_text("ℹ️ هذا المستخدم مشرف بالفعل.")
@@ -1328,7 +1505,7 @@ async def receive_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     context.user_data.clear()
     await update.message.reply_text(
-        "العودة إلى لوحة التحكم:", reply_markup=build_admin_reply_keyboard()
+        "العودة إلى لوحة التحكم:", reply_markup=build_admin_reply_keyboard(update.effective_user.id)
     )
     return ConversationHandler.END
 
@@ -1391,7 +1568,7 @@ async def broadcast_confirm_callback(
         context.user_data.clear()
         await query.edit_message_text("❌ تم إلغاء الإرسال الجماعي.")
         await query.message.reply_text(
-            "العودة:", reply_markup=build_admin_reply_keyboard()
+            "العودة:", reply_markup=build_admin_reply_keyboard(update.effective_user.id)
         )
         return ConversationHandler.END
 
@@ -1427,7 +1604,7 @@ async def broadcast_confirm_callback(
         f"✔️ نجح: <b>{success:,}</b>\n"
         f"✖️ فشل: <b>{failed:,}</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=build_admin_reply_keyboard(),
+        reply_markup=build_admin_reply_keyboard(update.effective_user.id),
     )
     return ConversationHandler.END
 
@@ -1471,7 +1648,7 @@ async def receive_channel_username(
     await update.message.reply_text(
         f"✅ تم إضافة القناة <b>@{text}</b> ({title}) بنجاح.",
         parse_mode=ParseMode.HTML,
-        reply_markup=build_admin_reply_keyboard(),
+        reply_markup=build_admin_reply_keyboard(update.effective_user.id),
     )
     return ConversationHandler.END
 
@@ -1480,7 +1657,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear()
     await update.message.reply_text(
         "❌ تم إلغاء العملية.",
-        reply_markup=build_admin_reply_keyboard(),
+        reply_markup=build_admin_reply_keyboard(update.effective_user.id),
     )
     return ConversationHandler.END
 
@@ -1496,10 +1673,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     tb_str = "".join(tb)[-2000:]
 
-    if OWNER_ID:
+    for oid in OWNER_IDS:
         try:
             await context.bot.send_message(
-                chat_id=OWNER_ID,
+                chat_id=oid,
                 text=(
                     "⚠️ <b>خطأ في البوت</b>\n\n"
                     f"<pre>{tb_str}</pre>"
@@ -1591,6 +1768,23 @@ def build_application() -> Application:
         allow_reentry=True,
     )
 
+    owners_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(owner_panel_callback, pattern="^owner_(add|remove)$")
+        ],
+        states={
+            ST_ADD_OWNER_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_owner_id)
+            ],
+            ST_REMOVE_OWNER_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_remove_owner_id)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(owners_conv)
+
     # ── Register handlers ─────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(add_admin_conv)
@@ -1604,7 +1798,8 @@ def build_application() -> Application:
             & ~filters.COMMAND
             & filters.Regex(
                 "^(📂 إدارة المحتوى|📢 إدارة القنوات|📊 إحصائيات"
-                "|💾 نسخ احتياطي|👁️ وضع الطالب"
+                "|💾 نسخ احتياطي|👁️ وضع الطالب|👑 إدارة الأونرز"
+                "|📣 إرسال رسالة جماعية|👤 إضافة مشرف"
                 "|🔙 العودة إلى لوحة التحكم|🚪 خروج من لوحة التحكم)$"
             ),
             admin_menu_router,
