@@ -361,7 +361,11 @@ async def check_subscription(bot, user_id):
     missing = []
     for ch in channels:
         try:
-            m = await bot.get_chat_member(chat_id=f"@{ch['channel_username']}", user_id=user_id)
+            # التأكد إذا كان المحفوظ ID أرقام أم معرف نصي
+            cid = ch['channel_username']
+            target = int(cid) if cid.lstrip('-').isdigit() else f"@{cid.lstrip('@')}"
+            
+            m = await bot.get_chat_member(chat_id=target, user_id=user_id)
             if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
                 missing.append(ch)
         except TelegramError:
@@ -371,9 +375,14 @@ async def check_subscription(bot, user_id):
 def subscription_required_keyboard(missing):
     buttons = []
     for ch in missing:
-        link = ch["invite_link"] or f"https://t.me/{ch['channel_username']}"
-        title = ch["channel_title"] or f"@{ch['channel_username']}"
+        link = ch["invite_link"]
+        # لو مفيش رابط محفوظ، يعمل رابط افتراضي كاحتياطي
+        if not link or link == "غير_متوفر":
+            link = f"https://t.me/{ch['channel_username'].lstrip('@')}"
+            
+        title = ch["channel_title"] or "قناة الاشتراك"
         buttons.append([InlineKeyboardButton(f"📢 {title}", url=link)])
+        
     buttons.append([InlineKeyboardButton("✅ تحقق من الاشتراك", callback_data="check_sub")])
     return InlineKeyboardMarkup(buttons)
 
@@ -748,7 +757,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_upsert_user(user_id, update.effective_user.first_name, update.effective_user.username)
             await query.edit_message_text("✅ تم التحقق! اضغط /start للبدء.")
         else:
-            await query.edit_message_reply_markup(reply_markup=subscription_required_keyboard(missing))
+            try:
+                # محاولة تعديل الأزرار لو كان في قنوات جديدة انضافت
+                await query.edit_message_reply_markup(reply_markup=subscription_required_keyboard(missing))
+            except BadRequest:
+                # لو الأزرار هي هي، نطلعله رسالة منبثقة بدل ما الكود يضرب
+                await query.answer("❌ لم تقم بالاشتراك في جميع القنوات بعد!", show_alert=True)
         return
 
     if data == "pg_info":
@@ -1330,18 +1344,23 @@ async def receive_vip_del(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def show_channels_panel(update, context):
     channels = db_get_channels()
-    text = "📢 <b>إدارة قنوات الاشتراك الإجباري</b>\n\n"
+    text = "📢 <b>إدارة قنوات/جروبات الاشتراك الإجباري</b>\n\n"
     if channels:
-        for ch in channels: text += f"• @{ch['channel_username']} — {ch['channel_title'] or 'بلا عنوان'}\n"
-    else: text += "<i>لا توجد قنوات.</i>"
-    buttons = [[InlineKeyboardButton(f"🗑️ حذف @{ch['channel_username']}", callback_data=f"a_rch_{ch['channel_username']}")] for ch in channels]
-    buttons.append([InlineKeyboardButton("➕ إضافة قناة", callback_data="a_ach_0")])
+        for ch in channels: 
+            text += f"• <b>{ch['channel_title']}</b> \n🔗 <a href='{ch['invite_link']}'>رابط الاشتراك</a>\n\n"
+    else: 
+        text += "<i>لا توجد قنوات حالياً.</i>"
+        
+    # بناء أزرار الحذف
+    buttons = [[InlineKeyboardButton(f"🗑️ حذف {ch['channel_title'][:15]}", callback_data=f"a_rch_{ch['channel_username']}")] for ch in channels]
+    buttons.append([InlineKeyboardButton("➕ إضافة قناة أو جروب", callback_data="a_ach_0")])
+    
     msg_obj = update.message or (update.callback_query.message if update.callback_query else None)
     if update.callback_query:
-        try: await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
-        except BadRequest: await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        try: await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(buttons))
+        except BadRequest: await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(buttons))
     else:
-        await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1478,17 +1497,61 @@ async def start_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ST_ADD_CHANNEL
 
 async def receive_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip().lstrip("@")
-    if not text: await update.message.reply_text("⚠️ أرسل الـ username أو /cancel."); return ST_ADD_CHANNEL
+    text = update.message.text.strip()
+    if text.lower() == "/cancel": 
+        return await cancel_conversation(update, context)
+
+    # استخراج المعرف أو الـ ID
+    if text.startswith("http"):
+        if "+" in text or "joinchat" in text:
+            await update.message.reply_text("⚠️ للجروبات الخاصة، يجب إرسال الـ ID الخاص بالجروب (مثال: -100123456789) وليس الرابط.")
+            return ST_ADD_CHANNEL
+        username = text.split("/")[-1].lstrip("@")
+    else:
+        username = text.lstrip("@")
+
     try:
-        chat = await context.bot.get_chat(f"@{text}")
-        title = chat.title or text; invite_link = chat.invite_link or f"https://t.me/{text}"
-    except TelegramError:
-        title, invite_link = text, f"https://t.me/{text}"
-    db_add_channel(text, title, invite_link); context.user_data.clear()
-    await update.message.reply_text(f"✅ تم إضافة @{text} ({title}).",
-                                    parse_mode=ParseMode.HTML, reply_markup=build_admin_reply_keyboard(update.effective_user.id))
-    return ConversationHandler.END
+        # نحدد إذا كان المدخل ID (للجروب الخاص) أو يوزرنيم (للقناة العامة)
+        chat_id = int(username) if username.lstrip("-").isdigit() else f"@{username}"
+        
+        # البوت يجلب بيانات الجروب/القناة (لازم يكون البوت مشرف فيها)
+        chat = await context.bot.get_chat(chat_id)
+        
+        # تجهيز البيانات للحفظ
+        save_id = str(chat.id)
+        title = chat.title or save_id
+        
+        # استخراج أو إنشاء رابط الدعوة
+        invite_link = chat.invite_link
+        if not invite_link:
+            if chat.username:
+                invite_link = f"https://t.me/{chat.username}"
+            else:
+                try:
+                    # لو الجروب خاص ومفيش رابط، البوت هيعمل رابط جديد ويحفظه
+                    invite_link = await context.bot.export_chat_invite_link(chat.id)
+                except TelegramError:
+                    invite_link = "غير_متوفر"
+
+        # حفظ في الداتا بيز
+        db_add_channel(save_id, title, invite_link)
+        context.user_data.clear()
+        
+        await update.message.reply_text(
+            f"✅ <b>تمت الإضافة بنجاح!</b>\n\n"
+            f"📌 <b>الاسم:</b> {title}\n🔗 <b>الرابط:</b> {invite_link}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_admin_reply_keyboard(update.effective_user.id)
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ <b>فشل الوصول!</b>\n"
+            f"تأكد أن البوت <b>مشرف (Admin)</b> في القناة/الجروب أولاً.\n\n<i>تفاصيل: {e}</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return ST_ADD_CHANNEL
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # لو كان بيضيف ملفات لمجموعة → احفظ ما تم
